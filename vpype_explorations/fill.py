@@ -6,8 +6,8 @@ import click
 import numpy as np
 import vpype as vp
 import vpype_cli
-from shapely.geometry import MultiLineString, Polygon
-from shapely.ops import unary_union
+from shapely.geometry import MultiLineString, MultiPolygon, Polygon, LinearRing
+from shapely.ops import unary_union, polygonize
 
 DEFAULT_PEN_WIDTH = vp.convert_length("0.3mm")
 
@@ -110,9 +110,10 @@ fill.help_group = "Plugins"
     help="Max distance between start and end point to consider a path closed "
     "(default: 0.01mm)",
 )
+@click.option("-d", "--difference", is_flag=True, default=False)
 @vpype_cli.layer_processor
 def cfill(
-    lines: vp.LineCollection, pen_width: float | None, tolerance: float
+    lines: vp.LineCollection, pen_width: float | None, tolerance: float, difference: bool
 ) -> vp.LineCollection:
     """Concentric fill.
 
@@ -121,19 +122,45 @@ def cfill(
     if pen_width is None:
         pen_width = lines.property(vp.METADATA_FIELD_PEN_WIDTH) or DEFAULT_PEN_WIDTH
 
-    new_lines = lines.clone()
-    for line in lines:
-        new_lines.append(line)
-        if np.abs(line[0] - line[-1]) <= tolerance:
-            p = Polygon((pt.real, pt.imag) for pt in line)
-            while True:
-                p = p.buffer(-pen_width)
-                if p.is_valid and len(p.exterior.coords) > 1:
-                    new_lines.append(p.exterior)
-                else:
-                    break
+    # empty line collection with the same metadata as the input
+    result = lines.clone()
 
-    return new_lines
+    def fill_poly(p: Polygon | MultiPolygon) -> None:
+        """Fills in a polygon by recursively adding buffers to the result line collection."""
+        if hasattr(p, "geoms"):
+            for part in p.geoms:
+                fill_poly(part)
+        elif p.is_valid and len(p.exterior.coords) > 1:
+            result.append(p.exterior)
+            result.extend(p.interiors)
+            fill_poly(p.buffer(-pen_width))
+
+    to_fill = []
+    for line in lines:
+        result.append(line)
+        # only fill closed lines
+        if np.abs(line[0] - line[-1]) <= tolerance:
+            ring = LinearRing((p.real, p.imag) for p in line)
+            if ring.is_valid:
+                to_fill.append(Polygon(ring))
+            else:
+                # try to fix self intersection
+                mp = MultiPolygon(polygonize(unary_union(ring)))
+                if mp.is_valid:
+                    to_fill.append(mp)
+                    mp.buffer
+
+    if to_fill:
+        if difference:
+            # compute what geometry to fill by taking the symmetric difference of all closed lines
+            geom = to_fill[0]
+            for p in to_fill[1:]:
+                geom = geom.symmetric_difference(p)
+        else:
+            geom = unary_union(to_fill)
+        fill_poly(geom.buffer(-pen_width))
+
+    return result
 
 
 fill.help_group = "Plugins"
